@@ -1,0 +1,290 @@
+---
+title: "Analyzing Aggravated Burglaries in Davidson County"
+output: html_notebook
+---
+```{r, warning=FALSE, message=FALSE}
+library(sf)
+library(tidyverse)
+```
+
+## Part 1: Load and prepare burglary data
+
+
+**We begin by loading the aggravated burglary data for 2023 and removing records that are missing location coordinates.**
+
+```{r}
+burglaries <- read_csv("../data/burglaries_2023.csv")
+burglaries_clean <- burglaries |>
+  filter(!is.na(latitude), !is.na(longitude))
+```
+**Convert to an sf object**
+
+*We convert the cleaned data into a spatial object using longitude and latitude.*
+
+```{r}
+burglaries_sf <- st_as_sf(
+  burglaries_clean,
+  coords = c("longitude", "latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+```
+
+```{r}
+burglaries_sf
+```
+**Read the census data**
+
+```{r}
+census <- read_csv("../data/census.csv")
+```
+```{r}
+census
+```
+
+```{r}
+census <- census |>
+  mutate(
+    median_income = if_else(median_income < 0, NA_real_, median_income)
+  )
+```
+*When I started plotting the census data, I noticed that the `median_income` values looked incorrect.* *Some tracts had extremely large negative numbers (for example, –666,666,666).* *These are not real incomes—they are special codes the Census uses to show missing data.*
+
+*To fix this and get accurate plots and results, I changed all negative income values to `NA` before continuing the analysis.*
+
+
+
+
+**Read the DC shape file data**
+
+```{r}
+dc_tracts <- st_read("../data/DC/DC.shp")
+```
+**Before we can perform a spatial join, we need to make sure both datasets use the same coordinate reference system (CRS).** **The burglary points are in WGS84 (EPSG:4326), while the census tracts use NAD83 (EPSG:4269).** **We transform the burglary data to match the tract CRS.**
+```{r}
+
+burglaries_sf_4269 <- st_transform(burglaries_sf, st_crs(dc_tracts))
+
+
+```
+**Now that both datasets use the same CRS, we can perform a spatial join.** **We use st_join() with st_within() to determine which census tract each burglary point falls inside.** **This attaches the tract information (such as the GEOID) to every burglary incident.**
+
+
+```{r}
+burg_with_tract <- st_join(
+  burglaries_sf_4269,  
+  dc_tracts,           
+  join = st_within     
+)
+burg_with_tract
+```
+
+**Before we can summarize the number of burglaries in each census tract, we need to remove the geometry so that the data behaves like a regular table.** **Each incident may appear multiple times (for example, if there are multiple victims), so we also remove duplicate incident numbers.** **After cleaning, we count the number of unique burglary incidents in each census tract.**
+
+```{r}
+
+burg_nogeome <- burg_with_tract |> st_drop_geometry()
+
+burg_unique <- burg_nogeome |> 
+  distinct(incident_number, GEOID, .keep_all = TRUE)
+
+burg_counts <- burg_unique |>
+  count(GEOID, name = "burglaries")
+
+head(burg_counts)
+```
+ **Create GEOID in the census data**
+
+*We construct a GEOID field in the census data by combining the state, county, and tract codes in the same format used in the tract shapefile.*
+```{r}
+census <- census |>
+  mutate(
+    state_chr = sprintf("%02.0f", state),   
+    GEOID = paste0(state_chr, county, tract)
+  )
+
+head(census)
+```
+
+
+
+
+*Because the GEOID requires a text string, the numeric state code (47) is converted into a two-digit string (‘47’) using the sprintf() function.*
+
+```{r}
+census_burg <- census |>
+  left_join(burg_counts, by = "GEOID") |>
+  mutate(
+    burglaries = replace_na(burglaries, 0)
+  )
+head(census_burg)
+```
+
+*Finally, we join the census and burglary attributes back to the tract shapefile so that we have a complete spatial dataset for mapping and modeling.*
+
+```{r}
+tract_data_sf <- dc_tracts |> left_join(census_burg, by = "GEOID")
+head(tract_data_sf)
+```
+### Part 2: Exploratory Analysis
+
+```{r}
+tract_data_sf <- tract_data_sf |>
+  rename(NAME = NAME.x) |>
+  select(-NAME.y)
+
+tract_data_sf
+```
+
+**Perform some exploratory analysis on your prepared dataset.**
+
+**Using the tract-level dataset prepared in Part 1 (which aggregates unique burglary incidents by census tract to avoid double-counting), we now explore patterns in burglary counts and rates.**
+
+*Which census tract had the highest number of burglaries?*
+```{r}
+top_burglary_count <- tract_data_sf |>
+  arrange(desc(burglaries)) |>
+  select(GEOID, NAME, burglaries) |>
+  slice(1)
+top_burglary_count
+```
+*The census tract with the highest number of aggravated burglaries in 2023 is Tract 160 (GEOID 47037016000), with a total of 39 incidents.*
+
+
+*Which census tract had the highest number of burglaries per 1000 residents?*
+
+```{r}
+tract_data_sf <- tract_data_sf |>
+  mutate(
+    burglary_rate_1000 = (burglaries / population) * 1000
+  )
+
+top_burglary_rate <- tract_data_sf |>
+  filter(population > 0) |>
+  arrange(desc(burglary_rate_1000)) |>
+  select(GEOID, NAME, burglary_rate_1000, population, burglaries) |>
+  slice(1)
+
+top_burglary_rate
+
+```
+*The census tract with the highest burglary rate per 1,000 residents is Tract 160 (GEOID 47037016000). This tract reported 39 aggravated burglaries and has a population of 2,570, resulting in a burglary rate of approximately 15.18 incidents per 1,000 residents.*
+
+
+**We're interested in the relationship between median income and number of aggravated burglaries, so examine those variables on their own and together to see what you can find. You may want to perform additional calculations, create plots, etc.**
+
+*Distribution of median income across census tracts*
+```{r}
+tract_data_sf |>
+  filter(!is.na(median_income)) |>     # remove missing incomes
+  ggplot(aes(x = median_income)) +
+  geom_histogram(bins = 30, fill = "steelblue") +
+  labs(
+    title = "Distribution of Median Income by Census Tract",
+    x = "Median Income",
+    y = "Count of Tracts"
+  ) +
+  theme_minimal()
+```
+*The median income varies across census tracts in Davidson County, with most tracts falling between about $40,000 and $80,000. After removing invalid negative values from the Census data, the distribution shows a right-skewed pattern, with a few higher-income tracts on the upper end.*
+
+
+*Distribution of aggravated burglaries across census tracts*
+
+```{r}
+
+  ggplot(tract_data_sf, aes(x = burglaries)) +
+  geom_histogram(bins = 30, fill = "firebrick") +
+  labs(
+    title = "Distribution of Aggravated Burglaries",
+    x = "Number of Burglaries",
+    y = "Count of Census Tracts"
+  ) +
+  theme_minimal()
+```
+*Most census tracts experienced relatively few aggravated burglaries in 2023, with the majority falling between 0 and 10 incidents. A small number of tracts had substantially higher counts, creating a right-skewed distribution. This suggests that aggravated burglaries are concentrated in specific areas rather than evenly distributed across the county.*
+
+
+**Relationship Between Median Income and Aggravated Burglary Counts**
+
+```{r}
+tract_data_sf |>
+  filter(!is.na(median_income)) |>     # remove missing incomes
+  ggplot(aes(x = median_income, y = burglaries)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y~x, se = FALSE, color = "blue") +
+  labs(
+    title = "Median Income vs. Aggravated Burglary Counts",
+    x = "Median Income",
+    y = "Number of Burglaries"
+  ) +
+  theme_minimal()
+```
+*To explore whether income is related to aggravated burglary activity, I created a scatterplot comparing median income (x-axis) with the number of burglaries in each census tract (y-axis). Each point represents a census tract, and a linear trend line is included to show the overall direction of the relationship.*
+
+
+### Part 3: Statistical Modeling
+
+**Fit a Poisson regression model with target variable the rate of burglaries per census tract and with predictor the median income.** **Offset using the log of the population so that we are looking at the rate of burglaries per population instead of the number of burglaries.** **How can you interpret the meaning of the output? How do the estimates from the model compare to the observed data?**
+
+
+
+```{r}
+model1 <- tract_data_sf |>
+  st_drop_geometry() |>
+  filter(
+    population>0,
+    !is.na(median_income),
+    !is.na(burglaries)
+  )
+```
+
+
+**Poisson regression model fit**
+
+```{r}
+model2 <- glm(
+  burglaries ~ median_income + offset(log(population)),
+  data = model1,
+  family =poisson()
+)
+
+summary(model2)
+```
+*Interpret the coefficient on median_income*
+
+```{r}
+model2 |> coef() |> exp()
+```
+*Income is measured in dollars, so the effect per $1 is too small to interpret. I scaled the coefficient to a $10,000 increase, which makes the rate ratio meaningful while still using the same exponentiation approach taught in class.*
+
+```{r}
+exp(10000 * coef(model2)["median_income"])
+```
+*For two census tracts with the same population, the tract with a $10,000 higher median income is estimated to have a burglary rate that is about 21.6% lower.*
+
+
+```{r}
+predict(
+  model2,
+  newdata = tibble(
+    median_income = c(30000, 80000),   
+    population = c(4000, 4000)        
+  ),
+  type = "response"
+)
+```
+*For two census tracts with the same population of 4,000 people, the model predicts about 10.8 aggravated burglaries in a tract with a median income of $30,000, compared to about 3.2 burglaries in a tract with a median income of $80,000. This reflects the model’s estimate that higher-income areas have substantially lower burglary rates.*
+
+## Final Summary
+
+* Converted burglary data into an sf object and aligned its CRS with the census tract shapefile.
+* Performed a spatial join to assign each burglary incident to a census tract.
+* Removed duplicate incidents and counted unique burglaries per tract.
+* Merged burglary counts with census population and median income data.
+* Cleaned the median income field by removing invalid negative values.
+* Explored the data through histograms and scatterplots, observing that lower-income tracts tend to have more burglaries.
+* Fit a Poisson regression model with an offset for population to model burglary rates.
+* Found a significant negative relationship: higher income → lower burglary rate.
+* A $10,000 increase in median income is associated with about a 21.6% decrease in the expected burglary rate.
+* Model predictions confirm that higher-income tracts have substantially fewer expected burglaries than lower-income tracts.
